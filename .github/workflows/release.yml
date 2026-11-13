@@ -1,0 +1,36 @@
+name: Release
+
+# Ενεργοποιείται όταν σπρώχνεται tag μορφής vX.Y.Z (π.χ. v0.1.0)
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Εγκατάσταση Rust nightly (χρειάζεται για build-std / Windows 7)
+        run: |
+          rustup toolchain install nightly --profile minimal --component rust-src
+          rustup default nightly
+
+      - name: Build (.exe συμβατό με Windows 7 και νεότερα, 64-bit)
+        run: cargo build --release -Z build-std=std,panic_abort --target x86_64-win7-windows-msvc
+
+      - name: Μετονομασία artifact με το version του tag
+        shell: pwsh
+        run: |
+          $ver = "${{ github.ref_name }}"
+          Copy-Item target\x86_64-win7-windows-msvc\release\aade-afm.exe "aade-afm-$ver.exe"
+
+      - name: Δημιουργία GitHub Release με το .exe
+        uses: softprops/action-gh-release@v2
+        with:
+          files: aade-afm-*.exe
+          generate_release_notes: true
