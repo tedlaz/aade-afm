@@ -64,6 +64,25 @@ cargo +nightly build --release -Z build-std=std,panic_abort --target x86_64-win7
 Actions workflow που κάνει build το `.exe` και το ανεβάζει ως artifact στο
 αντίστοιχο [Release](../../releases).
 
+### Δημιουργία νέας έκδοσης
+
+1. Κάντε commit τις αλλαγές σας στο `main` (ή κάντε merge το αντίστοιχο PR).
+2. Αυξήστε το version στο `Cargo.toml` (`version = "x.y.z"`) και κάντε commit.
+3. Βάλτε tag με το ίδιο version, με πρόθεμα `v`, και σπρώξτε το:
+
+   ```bash
+   git tag -a v0.1.1 -m "περιγραφή αλλαγών"
+   git push origin v0.1.1
+   ```
+
+4. Το workflow **Release** ξεκινά αυτόματα, φτιάχνει το `aade-afm-v0.1.1.exe`
+   και δημιουργεί νέο GitHub Release με το αρχείο επισυναπτόμενο. Παρακολουθήστε
+   την πρόοδο στην καρτέλα [Actions](../../actions) του repository.
+
+Ακολουθούμε το [Semantic Versioning](https://semver.org/lang/el/):
+`MAJOR.MINOR.PATCH` — αυξήστε το `PATCH` για διορθώσεις, το `MINOR` για νέες
+λειτουργίες χωρίς να σπάνε τα υπάρχοντα, το `MAJOR` για ασύμβατες αλλαγές.
+
 ## Άδεια χρήσης
 
 Το έργο διατίθεται υπό την άδεια **GNU General Public License v3.0**.
