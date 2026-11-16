@@ -8,7 +8,7 @@ use std::{cell::RefCell, rc::Rc, time::Duration};
 
 const URL: &str = "https://www1.gsis.gr/wsaade/RgWsPublic2/RgWsPublic2";
 const MIN_W: i32 = 780;
-const MIN_H: i32 = 540;
+const MIN_H: i32 = 570;
 
 // ---------------------------------------------------------------- ΑΑΔΕ
 
@@ -122,46 +122,125 @@ fn label(k: &str) -> &str {
     }
 }
 
+/// VIES (Ευρωπαϊκή Επιτροπή): χωρίς κωδικούς, αλλά μόνο επωνυμία/διεύθυνση και μόνο για ΑΦΜ
+/// ενεργά στις ενδοκοινοτικές. None σε σφάλμα ή μη έγκυρο ΑΦΜ.
+fn vies(cc: &str, afm: &str) -> Option<Value> {
+    let url = format!("https://ec.europa.eu/taxation_customs/vies/rest-api/ms/{cc}/vat/{afm}");
+    let body = ureq::get(&url).timeout(Duration::from_secs(15)).set("Accept", "application/json").call().ok()?.into_string().ok()?;
+    let raw: Value = serde_json::from_str(&body).ok()?;
+    if raw.get("isValid").or(raw.get("valid")) != Some(&Value::Bool(true)) {
+        return None;
+    }
+    // "---" = το κράτος-μέλος δεν κοινοποιεί το στοιχείο
+    let s = |k| raw.get(k).and_then(Value::as_str).map(str::trim).filter(|v| *v != "---").unwrap_or("");
+    let (name, title) = s("name").split_once("||").unwrap_or((s("name"), ""));
+    let [street, no, zip, area] = split_address(s("address"));
+    let basic = serde_json::json!({
+        "afm": if cc == "EL" { afm.to_string() } else { format!("{cc}{afm}") }, "onomasia": name.trim(), "commer_title": title.trim(),
+        "postal_address": street, "postal_address_no": no, "postal_zip_code": zip, "postal_area_description": area,
+    });
+    Some(basic)
+}
+
+const MODES: [&str; 3] = ["Ελλάδα – VIES", "Ελλάδα – ΑΑΔΕ", "Ενδοκοινοτική – VIES"];
+const MODE_GR_VIES: usize = 0;
+const MODE_GR_AADE: usize = 1;
+const MODE_EU_VIES: usize = 2;
+
+/// Κράτη-μέλη VIES εκτός Ελλάδας (XI = Βόρεια Ιρλανδία).
+const COUNTRIES: &[(&str, &str)] = &[
+    ("AT", "Αυστρία"), ("BE", "Βέλγιο"), ("BG", "Βουλγαρία"), ("CY", "Κύπρος"), ("CZ", "Τσεχία"),
+    ("DE", "Γερμανία"), ("DK", "Δανία"), ("EE", "Εσθονία"), ("ES", "Ισπανία"), ("FI", "Φινλανδία"),
+    ("FR", "Γαλλία"), ("HR", "Κροατία"), ("HU", "Ουγγαρία"), ("IE", "Ιρλανδία"), ("IT", "Ιταλία"),
+    ("LT", "Λιθουανία"), ("LU", "Λουξεμβούργο"), ("LV", "Λετονία"), ("MT", "Μάλτα"), ("NL", "Ολλανδία"),
+    ("PL", "Πολωνία"), ("PT", "Πορτογαλία"), ("RO", "Ρουμανία"), ("SE", "Σουηδία"), ("SI", "Σλοβενία"),
+    ("SK", "Σλοβακία"), ("XI", "Βόρεια Ιρλανδία"),
+];
+
+/// «de 123.456.789» με χώρα DE → «123456789» (χωρίς σημεία στίξης και πρόθεμα χώρας).
+fn clean_vat(cc: &str, input: &str) -> String {
+    let s = input.chars().filter(char::is_ascii_alphanumeric).collect::<String>().to_ascii_uppercase();
+    let alias = if cc == "EL" { "GR" } else { cc };
+    s.strip_prefix(cc).or(s.strip_prefix(alias)).unwrap_or(&s).to_string()
+}
+
+/// Διεύθυνση VIES «ΑΙΟΛΟΥ 86        10559 - ΑΘΗΝΑ» → [οδός, αριθμός, Τ.Κ., περιοχή].
+/// Πιάνει και τη συνήθη μορφή ΕΕ «VIA RICHINI 6\n20122 MILANO MI».
+/// ponytail: απλοί κανόνες (π.χ. όχι «AT-5330 Fuschl»)· ό,τι δεν ταιριάζει μένει ολόκληρο στην οδό.
+fn split_address(a: &str) -> [String; 4] {
+    let mut parts: Vec<&str> =
+        a.lines().flat_map(|l| l.split("   ")).map(|p| p.trim_matches([' ', ','])).filter(|p| !p.is_empty()).collect();
+    let (mut zip, mut area) = ("", "");
+    if parts.len() > 1 && parts.last().is_some_and(|p| p.starts_with(|c: char| c.is_ascii_digit())) {
+        let last = parts.pop().unwrap();
+        let (z, c) = last.split_once(' ').unwrap_or((last, ""));
+        (zip, area) = (z, c.trim_start_matches(['-', ' ']));
+    }
+    let street = parts.join(", ");
+    let (street, no) = match street.rsplit_once(' ') {
+        Some((s, n)) if n.starts_with(|c: char| c.is_ascii_digit()) => (s.to_string(), n.to_string()),
+        _ => (street.clone(), String::new()),
+    };
+    [street, no, zip.into(), area.into()]
+}
+
 fn creds() -> Option<keyring::Entry> {
     keyring::Entry::new("aade-afm-lookup", "credentials").ok()
 }
 
 // ---------------------------------------------------------------- φόρμα
 
-/// (tab, γραμμή, στήλη 0=αριστερά 1=δεξιά 2=όλο το πλάτος, πεδίο)
-const FIELDS: &[(usize, usize, u8, &str)] = &[
-    (0, 0, 2, "onomasia"),
-    (0, 1, 2, "commer_title"),
-    (0, 2, 0, "afm"),
-    (0, 2, 1, "legal_status_descr"),
-    (0, 3, 0, "doy_descr"),
-    (0, 3, 1, "doy"),
-    (0, 4, 0, "deactivation_flag_descr"),
-    (0, 4, 1, "deactivation_flag"),
-    (0, 5, 0, "firm_flag_descr"),
-    (0, 5, 1, "i_ni_flag_descr"),
-    (0, 6, 0, "postal_address"),
-    (0, 6, 1, "postal_address_no"),
-    (0, 7, 0, "postal_zip_code"),
-    (0, 7, 1, "postal_area_description"),
-    (0, 8, 0, "regist_date"),
-    (0, 8, 1, "stop_date"),
-    (0, 9, 0, "normal_vat_system_flag"),
-    (2, 0, 0, "call_seq_id"),
-    (2, 0, 1, "as_on_date"),
-    (2, 1, 0, "token_username"),
-    (2, 2, 0, "token_afm"),
-    (2, 2, 1, "token_afm_fullname"),
-    (2, 3, 0, "afm_called_by"),
-    (2, 3, 1, "afm_called_by_fullname"),
-    (2, 4, 0, "error_code"),
-    (2, 5, 2, "error_descr"),
+/// Σελίδες με πεδία: οι δύο καρτέλες VIES και οι υποκαρτέλες της ΑΑΔΕ.
+const P_GR: usize = 0;
+const P_EU: usize = 1;
+const P_BASIC: usize = 2;
+const P_CALL: usize = 3;
+
+/// (γραμμή, στήλη 0=αριστερά 1=δεξιά 2=όλο το πλάτος, πεδίο) — ό,τι δίνει το VIES
+const VIES_FIELDS: &[(usize, u8, &str)] = &[
+    (0, 2, "onomasia"),
+    (1, 2, "commer_title"),
+    (2, 0, "afm"),
+    (3, 0, "postal_address"),
+    (3, 1, "postal_address_no"),
+    (4, 0, "postal_zip_code"),
+    (4, 1, "postal_area_description"),
+];
+/// (σελίδα, γραμμή, στήλη, πεδίο) — ΑΑΔΕ
+const AADE_FIELDS: &[(usize, usize, u8, &str)] = &[
+    (P_BASIC, 0, 2, "onomasia"),
+    (P_BASIC, 1, 2, "commer_title"),
+    (P_BASIC, 2, 0, "afm"),
+    (P_BASIC, 2, 1, "legal_status_descr"),
+    (P_BASIC, 3, 0, "doy_descr"),
+    (P_BASIC, 3, 1, "doy"),
+    (P_BASIC, 4, 0, "deactivation_flag_descr"),
+    (P_BASIC, 4, 1, "deactivation_flag"),
+    (P_BASIC, 5, 0, "firm_flag_descr"),
+    (P_BASIC, 5, 1, "i_ni_flag_descr"),
+    (P_BASIC, 6, 0, "postal_address"),
+    (P_BASIC, 6, 1, "postal_address_no"),
+    (P_BASIC, 7, 0, "postal_zip_code"),
+    (P_BASIC, 7, 1, "postal_area_description"),
+    (P_BASIC, 8, 0, "regist_date"),
+    (P_BASIC, 8, 1, "stop_date"),
+    (P_BASIC, 9, 0, "normal_vat_system_flag"),
+    (P_CALL, 0, 0, "call_seq_id"),
+    (P_CALL, 0, 1, "as_on_date"),
+    (P_CALL, 1, 0, "token_username"),
+    (P_CALL, 2, 0, "token_afm"),
+    (P_CALL, 2, 1, "token_afm_fullname"),
+    (P_CALL, 3, 0, "afm_called_by"),
+    (P_CALL, 3, 1, "afm_called_by_fullname"),
+    (P_CALL, 4, 0, "error_code"),
+    (P_CALL, 5, 2, "error_descr"),
 ];
 const MULTI: &[&str] = &["onomasia", "error_descr"]; // πολλές γραμμές με αναδίπλωση
 const LABEL_W: i32 = 165;
 const ROW_H: i32 = 26;
 const MULTI_H: i32 = 46;
 const GAP: i32 = 8;
+const BAR_H: i32 = 40; // γραμμή αναζήτησης στην κορυφή κάθε καρτέλας
 
 enum Val {
     Line(nwg::TextInput),
@@ -170,7 +249,7 @@ enum Val {
 }
 
 struct Field {
-    tab: usize,
+    page: usize,
     row: usize,
     col: u8,
     key: &'static str,
@@ -178,23 +257,33 @@ struct Field {
     val: Val,
 }
 
+/// ΑΦΜ + Αναζήτηση, μία ανά καρτέλα αναζήτησης.
+#[derive(Default)]
+struct Bar {
+    l_afm: nwg::Label,
+    afm: nwg::TextInput,
+    search: nwg::Button,
+    note: nwg::RichLabel,
+}
+
 #[derive(Default)]
 struct Ui {
     window: nwg::Window,
     embed: nwg::EmbedResource,
     icon: nwg::Icon,
+    tabs: nwg::TabsContainer,
+    tab: [nwg::Tab; 4], // MODES + Παράμετροι
+    bars: [Bar; 3],
+    country: nwg::ComboBox<String>,
+    itabs: nwg::TabsContainer, // υποκαρτέλες ΑΑΔΕ
+    itab: [nwg::Tab; 3],
+    acts: nwg::TextBox,
     l_user: nwg::Label,
     user: nwg::TextInput,
     l_pass: nwg::Label,
     pass: nwg::TextInput,
+    fallback: nwg::CheckBox,
     save: nwg::Button,
-    l_afm: nwg::Label,
-    afm: nwg::TextInput,
-    search: nwg::Button,
-    export: nwg::Button,
-    tabs: nwg::TabsContainer,
-    tab: [nwg::Tab; 3],
-    acts: nwg::TextBox,
     status: nwg::StatusBar,
     fields: Vec<Field>,
     last: RefCell<Option<Value>>,
@@ -207,45 +296,76 @@ fn build() -> Result<Rc<Ui>, nwg::NwgError> {
     nwg::Window::builder()
         .size((MIN_W, MIN_H))
         .center(true)
-        .title("ΑΑΔΕ – Αναζήτηση Βασικών Στοιχείων Μητρώου")
+        .title(concat!("ΑΑΔΕ – Αναζήτηση Βασικών Στοιχείων Μητρώου  v", env!("CARGO_PKG_VERSION")))
         .icon(Some(&ui.icon))
         .build(&mut ui.window)?;
-    let w = &ui.window;
 
-    let cap = |l: &mut nwg::Label, t: &str| {
-        nwg::Label::builder().text(t).parent(w).h_align(nwg::HTextAlign::Right).build(l)
-    };
-    cap(&mut ui.l_user, "Κωδικός:")?;
-    nwg::TextInput::builder().parent(w).build(&mut ui.user)?;
-    cap(&mut ui.l_pass, "Συνθηματικό:")?;
-    nwg::TextInput::builder().parent(w).password(Some('●')).build(&mut ui.pass)?;
-    nwg::Button::builder().text("Αποθήκευση").parent(w).build(&mut ui.save)?;
-    cap(&mut ui.l_afm, "ΑΦΜ:")?;
-    nwg::TextInput::builder().parent(w).limit(9).build(&mut ui.afm)?;
-    nwg::Button::builder().text("Αναζήτηση").parent(w).build(&mut ui.search)?;
-    nwg::Button::builder().text("Εξαγωγή JSON").parent(w).enabled(false).build(&mut ui.export)?;
-
-    nwg::TabsContainer::builder().parent(w).build(&mut ui.tabs)?;
-    for (t, name) in ui.tab.iter_mut().zip(["Βασικά στοιχεία", "Δραστηριότητες", "Στοιχεία κλήσης"]) {
+    nwg::TabsContainer::builder().parent(&ui.window).build(&mut ui.tabs)?;
+    for (t, name) in ui.tab.iter_mut().zip(MODES.into_iter().chain(["Παράμετροι"])) {
         nwg::Tab::builder().text(name).parent(&ui.tabs).build(t)?;
     }
+    let cap = |l: &mut nwg::Label, t: &str, p: &nwg::Tab, bg: [u8; 3]| {
+        nwg::Label::builder().text(t).parent(p).background_color(Some(bg)).build(l)
+    };
 
-    for &(tab, row, col, key) in FIELDS {
-        let parent = &ui.tab[tab];
+    // Γραμμή αναζήτησης σε κάθε καρτέλα (η ενδοκοινοτική έχει και επιλογή χώρας)
+    nwg::ComboBox::builder()
+        .parent(&ui.tab[MODE_EU_VIES])
+        .collection(COUNTRIES.iter().map(|(c, n)| format!("{c} – {n}")).collect())
+        .selected_index(Some(0))
+        .build(&mut ui.country)?;
+    for (i, (b, p)) in ui.bars.iter_mut().zip(&ui.tab).enumerate() {
+        cap(&mut b.l_afm, "ΑΦΜ:", p, TAB_BG[i])?;
+        nwg::TextInput::builder().parent(p).limit(20).build(&mut b.afm)?;
+        nwg::Button::builder().text("Αναζήτηση").parent(p).build(&mut b.search)?;
+        // RichLabel: το απλό Label του NWG δεν έχει χρώμα κειμένου
+        let aade = i == MODE_GR_AADE;
+        let note = if aade { "Αναζήτηση με κωδικούς ΑΑΔΕ" } else { "Ανώνυμη αναζήτηση" };
+        nwg::RichLabel::builder().text(note).parent(p).background_color(Some(TAB_BG[i])).build(&mut b.note)?;
+        let color = if aade { [200, 0, 0] } else { [100, 100, 100] };
+        b.note.set_char_format(0..b.note.len(), &nwg::CharFormat {
+            text_color: Some(color),
+            height: Some(200), // 10pt σε twips, όπως οι υπόλοιπες ετικέτες
+            font_face_name: Some("Segoe UI".into()),
+            ..Default::default()
+        });
+    }
+
+    nwg::TabsContainer::builder().parent(&ui.tab[MODE_GR_AADE]).build(&mut ui.itabs)?;
+    for (t, name) in ui.itab.iter_mut().zip(["Βασικά στοιχεία", "Δραστηριότητες", "Στοιχεία κλήσης"]) {
+        nwg::Tab::builder().text(name).parent(&ui.itabs).build(t)?;
+    }
+
+    // Παράμετροι: κωδικοί ΑΑΔΕ
+    let p = &ui.tab[3];
+    cap(&mut ui.l_user, "Κωδικός ΑΑΔΕ:", p, TAB_BG[3])?;
+    nwg::TextInput::builder().parent(p).build(&mut ui.user)?;
+    cap(&mut ui.l_pass, "Συνθηματικό ΑΑΔΕ:", p, TAB_BG[3])?;
+    nwg::TextInput::builder().parent(p).password(Some('●')).build(&mut ui.pass)?;
+    nwg::CheckBox::builder()
+        .text("«Ελλάδα – VIES»: αν το ΑΦΜ δεν βρεθεί στο VIES, αναζήτηση στην ΑΑΔΕ")
+        .parent(p)
+        .background_color(Some(TAB_BG[3]))
+        .build(&mut ui.fallback)?;
+    nwg::Button::builder().text("Αποθήκευση").parent(p).build(&mut ui.save)?;
+
+    let specs = [P_GR, P_EU]
+        .into_iter()
+        .flat_map(|p| VIES_FIELDS.iter().map(move |&(r, c, k)| (p, r, c, k)))
+        .chain(AADE_FIELDS.iter().copied());
+    for (page, row, col, key) in specs {
+        let parent = match page {
+            P_GR => &ui.tab[MODE_GR_VIES],
+            P_EU => &ui.tab[MODE_EU_VIES],
+            P_BASIC => &ui.itab[0],
+            _ => &ui.itab[2],
+        };
+        let bg = TAB_BG[match page { P_GR => MODE_GR_VIES, P_EU => MODE_EU_VIES, _ => MODE_GR_AADE }];
         let mut label = nwg::Label::default();
-        // λευκό φόντο, όπως η σελίδα του tab
-        nwg::Label::builder()
-            .text(&label_of(key))
-            .parent(parent)
-            .background_color(Some([255, 255, 255]))
-            .build(&mut label)?;
+        cap(&mut label, &label_of(key), parent, bg)?;
         let val = if key == "normal_vat_system_flag" {
             let mut c = nwg::CheckBox::default();
-            nwg::CheckBox::builder()
-                .text("")
-                .parent(parent)
-                .background_color(Some([255, 255, 255]))
-                .build(&mut c)?;
+            nwg::CheckBox::builder().text("").parent(parent).background_color(Some(bg)).build(&mut c)?;
             Val::Check(c)
         } else if MULTI.contains(&key) {
             let mut t = nwg::TextBox::default();
@@ -260,26 +380,69 @@ fn build() -> Result<Rc<Ui>, nwg::NwgError> {
             nwg::TextInput::builder().parent(parent).readonly(true).build(&mut t)?;
             Val::Line(t)
         };
-        ui.fields.push(Field { tab, row, col, key, label, val });
+        ui.fields.push(Field { page, row, col, key, label, val });
     }
 
     // Δραστηριότητες: κείμενο με αναδίπλωση (ο πίνακας των Windows κόβει τις μεγάλες περιγραφές)
     nwg::TextBox::builder()
-        .parent(&ui.tab[1])
+        .parent(&ui.itab[1])
         .readonly(true)
         .flags(nwg::TextBoxFlags::VISIBLE | nwg::TextBoxFlags::VSCROLL | nwg::TextBoxFlags::TAB_STOP)
         .build(&mut ui.acts)?;
 
-    nwg::StatusBar::builder().parent(w).text(" Συμπληρώστε ΑΦΜ και πατήστε Αναζήτηση.").build(&mut ui.status)?;
+    nwg::StatusBar::builder().parent(&ui.window).text(" Συμπληρώστε ΑΦΜ και πατήστε Αναζήτηση.").build(&mut ui.status)?;
+
+    // Χρώμα σελίδων: στο τέλος, ώστε ο handler να προηγείται αυτών των controls
+    for (t, &bg) in ui.tab.iter().zip(&TAB_BG) {
+        paint_bg(t, bg);
+    }
+    for t in &ui.itab {
+        paint_bg(t, TAB_BG[MODE_GR_AADE]);
+    }
 
     // Φόρτωση αποθηκευμένων στοιχείων από τον Windows Credential Manager
     if let Some(s) = creds().and_then(|e| e.get_password().ok()) {
-        if let Some((u, p)) = s.split_once('\n') {
-            ui.user.set_text(u);
-            ui.pass.set_text(p);
+        // ponytail: η επιλογή fallback αποθηκεύεται ως 3η γραμμή μαζί με τους κωδικούς
+        let mut it = s.splitn(3, '\n');
+        ui.user.set_text(it.next().unwrap_or(""));
+        ui.pass.set_text(it.next().unwrap_or(""));
+        if it.next() == Some("1") {
+            ui.fallback.set_check_state(nwg::CheckBoxState::Checked);
         }
     }
     Ok(Rc::new(ui))
+}
+
+/// Χρώμα φόντου ανά καρτέλα (MODES + Παράμετροι), για να φαίνεται αμέσως πού βρισκόμαστε.
+const TAB_BG: [[u8; 3]; 4] = [[226, 238, 252], [255, 241, 222], [228, 245, 230], [255, 255, 255]];
+
+/// Βάφει το φόντο μιας σελίδας tab (το Tab του NWG δεν έχει background_color), καθώς και
+/// ετικέτες/checkbox με διάφανο φόντο κειμένου (το NWG δίνει μόνο brush, το κείμενο μένει σε λευκό).
+/// Τα read-only πεδία (Edit) κρατούν το γκρι τους.
+fn paint_bg(tab: &nwg::Tab, [r, g, b]: [u8; 3]) {
+    use winapi::um::wingdi::{CreateSolidBrush, RGB, SetBkMode, TRANSPARENT};
+    use winapi::um::winuser::{FillRect, GetClassNameW, GetClientRect, WM_CTLCOLORSTATIC, WM_ERASEBKGND};
+    let brush = unsafe { CreateSolidBrush(RGB(r, g, b)) } as usize; // ζει όσο η εφαρμογή
+    let _ = nwg::bind_raw_event_handler(&tab.handle, 0x10000, move |hwnd, msg, w, l| unsafe {
+        match msg {
+            WM_ERASEBKGND => {
+                let mut rc = std::mem::zeroed();
+                GetClientRect(hwnd, &mut rc);
+                FillRect(w as _, &rc, brush as _);
+                Some(1)
+            }
+            WM_CTLCOLORSTATIC => {
+                let mut cls = [0u16; 16];
+                let n = GetClassNameW(l as _, cls.as_mut_ptr(), cls.len() as i32) as usize;
+                if String::from_utf16_lossy(&cls[..n]) == "Edit" {
+                    return None;
+                }
+                SetBkMode(w as _, TRANSPARENT as i32);
+                Some(brush as _)
+            }
+            _ => None,
+        }
+    });
 }
 
 fn label_of(k: &str) -> String {
@@ -291,47 +454,62 @@ impl Ui {
     fn layout(&self) {
         let (w, h) = self.window.size();
         let (w, h) = (w as i32, h as i32);
-        self.l_user.place(8, 15, 80, 22);
-        self.user.place(94, 12, 210, 26);
-        self.l_pass.place(312, 15, 92, 22);
-        self.pass.place(410, 12, (w - 410 - 132).max(120), 26);
-        self.save.place(w - 122, 11, 110, 28);
-        self.l_afm.place(8, 49, 80, 22);
-        self.afm.place(94, 46, 210, 26);
-        self.search.place(312, 45, 130, 28);
-        self.export.place(450, 45, 130, 28);
-
-        let top = 84;
         let status_h = 26;
-        let tabs_h = (h - top - status_h - 8).max(100);
-        self.tabs.place(8, top, w - 16, tabs_h);
+        let tabs_h = (h - GAP - status_h - GAP).max(100);
+        self.tabs.place(GAP, GAP, w - 2 * GAP, tabs_h);
         // εσωτερικό tab ≈ container μείον κεφαλίδα καρτελών και περιθώρια
-        let (tw, th) = (w - 16 - 8, tabs_h - 34);
+        let (tw, th) = (w - 2 * GAP - 8, tabs_h - 34);
+
+        // Γραμμή αναζήτησης
+        for (i, b) in self.bars.iter().enumerate() {
+            let x = if i == MODE_EU_VIES { GAP + 180 + GAP } else { GAP };
+            b.l_afm.place(x, GAP + 7, 40, 20);
+            b.afm.place(x + 44, GAP + 4, 150, ROW_H);
+            b.search.place(x + 44 + 150 + GAP, GAP + 3, 120, 28);
+            let nx = x + 44 + 150 + GAP + 120 + 2 * GAP;
+            b.note.place(nx, GAP + 9, tw - nx - GAP, 20);
+        }
+        self.country.place(GAP, GAP + 4, 180, ROW_H);
+
+        // Υποκαρτέλες ΑΑΔΕ κάτω από τη γραμμή αναζήτησης
+        let (iw, ih) = (tw - 2 * GAP, th - BAR_H - 2 * GAP);
+        self.itabs.place(GAP, BAR_H + GAP, iw, ih);
+        let (iw, ih) = (iw - 8, ih - 34);
+        self.acts.place(GAP, GAP, iw - 2 * GAP, ih - 2 * GAP);
 
         // Πεδία: δύο στήλες (ετικέτα + τιμή), ή μία σε όλο το πλάτος
-        let half = (tw - 3 * GAP) / 2;
         for f in &self.fields {
-            let mut y = GAP + 4;
+            let (top, pw) = if f.page == P_GR || f.page == P_EU { (BAR_H, tw) } else { (0, iw) };
+            let mut y = top + GAP + 4;
             for r in 0..f.row {
-                let multi = self.fields.iter().any(|g| g.tab == f.tab && g.row == r && MULTI.contains(&g.key));
+                let multi = self.fields.iter().any(|g| g.page == f.page && g.row == r && MULTI.contains(&g.key));
                 y += if multi { MULTI_H } else { ROW_H } + GAP;
             }
+            let half = (pw - 3 * GAP) / 2;
             let (x, cw) = match f.col {
                 0 => (GAP, half),
                 1 => (2 * GAP + half, half),
-                _ => (GAP, tw - 2 * GAP),
+                _ => (GAP, pw - 2 * GAP),
             };
             let vh = if MULTI.contains(&f.key) { MULTI_H } else { ROW_H };
             f.label.place(x, y + 4, LABEL_W, 20);
             f.val.place(x + LABEL_W, y, cw - LABEL_W, vh);
         }
-        self.acts.place(GAP, GAP, tw - 2 * GAP, th - 2 * GAP);
+
+        let y = |r: i32| GAP + 4 + r * (ROW_H + GAP);
+        self.l_user.place(GAP, y(0) + 4, LABEL_W, 20);
+        self.user.place(GAP + LABEL_W, y(0), 260, ROW_H);
+        self.l_pass.place(GAP, y(1) + 4, LABEL_W, 20);
+        self.pass.place(GAP + LABEL_W, y(1), 260, ROW_H);
+        self.fallback.place(GAP, y(2), tw - 2 * GAP, ROW_H);
+        self.save.place(GAP + LABEL_W, y(3) + GAP, 130, 28);
     }
 
-    fn fill(&self, json: &Value) {
+    /// Γεμίζει τα πεδία των σελίδων `pages` (Null = καθάρισμα).
+    fn fill(&self, json: &Value, pages: &[usize]) {
         let basic = json.get("basic_rec").unwrap_or(json);
-        for f in &self.fields {
-            let v = find(if f.tab == 0 { basic } else { json }, f.key).unwrap_or("");
+        for f in self.fields.iter().filter(|f| pages.contains(&f.page)) {
+            let v = find(if f.page == P_CALL { json } else { basic }, f.key).unwrap_or("");
             match &f.val {
                 Val::Line(t) => t.set_text(v),
                 Val::Multi(t) => t.set_text(v),
@@ -341,25 +519,62 @@ impl Ui {
                 }
             }
         }
-        self.acts.set_text(&acts_text(json));
     }
 
-    fn do_search(&self) {
-        let afm = self.afm.text();
-        let (user, pass) = (self.user.text(), self.pass.text());
-        if afm.len() != 9 || !afm.bytes().all(|b| b.is_ascii_digit()) {
-            nwg::modal_error_message(&self.window, "ΑΦΜ", "Το ΑΦΜ πρέπει να έχει 9 ψηφία.");
+    fn has_creds(&self) -> bool {
+        !self.user.text().trim().is_empty() && !self.pass.text().is_empty()
+    }
+
+    fn do_search(&self, mode: usize) {
+        let cc = if mode == MODE_EU_VIES { COUNTRIES[self.country.selection().unwrap_or(0)].0 } else { "EL" };
+        let afm = clean_vat(cc, &self.bars[mode].afm.text());
+        if cc == "EL" && (afm.len() != 9 || !afm.bytes().all(|b| b.is_ascii_digit())) {
+            nwg::modal_error_message(&self.window, "ΑΦΜ", "Το ελληνικό ΑΦΜ πρέπει να έχει 9 ψηφία.");
             return;
         }
-        if user.trim().is_empty() || pass.is_empty() {
-            nwg::modal_error_message(&self.window, "Στοιχεία", "Συμπληρώστε κωδικό και συνθηματικό.");
+        if afm.is_empty() {
+            nwg::modal_error_message(&self.window, "ΑΦΜ", "Συμπληρώστε το ΑΦΜ.");
             return;
         }
-        self.status.set_text(0, " Αναζήτηση…");
-        // ponytail: blocking κλήση στο UI thread (~1-2s), thread αν γίνει ενοχλητικό
-        match query(user.trim(), &pass, &afm).and_then(|x| parse(&x)) {
+        if mode == MODE_GR_AADE {
+            return self.aade(&afm);
+        }
+        let page = if mode == MODE_GR_VIES { P_GR } else { P_EU };
+        let shown = if cc == "EL" { afm.clone() } else { format!("{cc}{afm}") };
+        self.status.set_text(0, " Αναζήτηση στο VIES…");
+        // ponytail: blocking κλήσεις στο UI thread (~1-2s), thread αν γίνει ενοχλητικό
+        match vies(cc, &afm) {
+            Some(json) => {
+                self.fill(&json, &[page]);
+                let name = find(&json, "onomasia").unwrap_or("");
+                self.status.set_text(0, &format!(" {shown}: {name}  (VIES)"));
+            }
+            None => {
+                self.fill(&Value::Null, &[page]);
+                let fallback = self.fallback.check_state() == nwg::CheckBoxState::Checked;
+                if mode == MODE_GR_VIES && fallback && self.has_creds() {
+                    self.bars[MODE_GR_AADE].afm.set_text(&afm);
+                    self.tabs.set_selected_tab(MODE_GR_AADE);
+                    return self.aade(&afm);
+                }
+                self.status.set_text(0, " Δεν βρέθηκε στο VIES.");
+                let msg = format!("Το ΑΦΜ {shown} δεν είναι έγκυρο στο VIES ή η υπηρεσία δεν είναι διαθέσιμη.");
+                nwg::modal_error_message(&self.window, "VIES", &msg);
+            }
+        }
+    }
+
+    fn aade(&self, afm: &str) {
+        if !self.has_creds() {
+            let msg = "Συμπληρώστε κωδικό και συνθηματικό ΑΑΔΕ στις Παραμέτρους,\nή χρησιμοποιήστε την αναζήτηση «Ελλάδα – VIES».";
+            nwg::modal_error_message(&self.window, "Στοιχεία", msg);
+            return;
+        }
+        self.status.set_text(0, " Αναζήτηση στην ΑΑΔΕ…");
+        match query(self.user.text().trim(), &self.pass.text(), afm).and_then(|x| parse(&x)) {
             Ok(json) => {
-                self.fill(&json);
+                self.fill(&json, &[P_BASIC, P_CALL]);
+                self.acts.set_text(&acts_text(&json));
                 match json.pointer("/error_rec/error_descr").and_then(Value::as_str) {
                     Some(d) => {
                         self.status.set_text(0, &format!(" Σφάλμα: {d}"));
@@ -367,12 +582,11 @@ impl Ui {
                     }
                     None => {
                         let name = find(&json, "onomasia").unwrap_or("");
-                        self.status.set_text(0, &format!(" {afm}: {name}"));
+                        self.status.set_text(0, &format!(" {afm}: {name}  (ΑΑΔΕ)"));
                     }
                 }
                 *self.last.borrow_mut() = Some(json);
-                self.export.set_enabled(true);
-                self.tabs.set_selected_tab(0);
+                self.itabs.set_selected_tab(0);
             }
             Err(e) => {
                 self.status.set_text(0, " Αποτυχία αναζήτησης.");
@@ -383,25 +597,14 @@ impl Ui {
 
     fn do_save(&self) {
         let res = creds().ok_or("keyring".to_string()).and_then(|e| {
-            e.set_password(&format!("{}\n{}", self.user.text().trim(), self.pass.text()))
+            let v = self.fallback.check_state() == nwg::CheckBoxState::Checked;
+            e.set_password(&format!("{}\n{}\n{}", self.user.text().trim(), self.pass.text(), v as u8))
                 .map_err(|e| e.to_string())
         });
         match res {
-            Ok(_) => nwg::modal_info_message(&self.window, "Αποθήκευση", "Τα στοιχεία αποθηκεύτηκαν."),
+            Ok(_) => nwg::modal_info_message(&self.window, "Αποθήκευση", "Οι παράμετροι αποθηκεύτηκαν."),
             Err(e) => nwg::modal_error_message(&self.window, "Αποθήκευση", &format!("Αποτυχία: {e}")),
         };
-    }
-
-    fn do_export(&self) {
-        let Some(json) = self.last.borrow().clone() else { return };
-        let afm = json.get("basic_rec").and_then(|b| find(b, "afm")).unwrap_or("").to_string();
-        let afm = if afm.is_empty() { self.afm.text() } else { afm };
-        let Some(path) = save_dialog(&self.window, &format!("{afm}.json")) else { return };
-        if let Err(e) = std::fs::write(&path, serde_json::to_string_pretty(&json).unwrap()) {
-            nwg::modal_error_message(&self.window, "Εξαγωγή", &format!("Αποτυχία εγγραφής: {e}"));
-        } else {
-            self.status.set_text(0, &format!(" Αποθηκεύτηκε: {}", path.display()));
-        }
     }
 }
 
@@ -420,35 +623,6 @@ fn acts_text(json: &Value) -> String {
         .join("\r\n\r\n")
 }
 
-/// Παράθυρο «Αποθήκευση ως» των Windows με προτεινόμενο όνομα αρχείου
-/// (το FileDialog του NWG δεν υποστηρίζει προτεινόμενο όνομα).
-fn save_dialog(owner: &nwg::Window, name: &str) -> Option<std::path::PathBuf> {
-    use std::os::windows::ffi::OsStringExt;
-    use winapi::um::commdlg::*;
-    let wide = |s: &str| s.encode_utf16().collect::<Vec<u16>>();
-    let mut file = [0u16; 1024];
-    for (i, c) in name.encode_utf16().take(file.len() - 1).enumerate() {
-        file[i] = c;
-    }
-    let filter = wide("JSON (*.json)\0*.json\0Όλα τα αρχεία (*.*)\0*.*\0\0");
-    let ext = wide("json\0");
-    let title = wide("Εξαγωγή JSON\0");
-    let mut ofn: OPENFILENAMEW = unsafe { std::mem::zeroed() };
-    ofn.lStructSize = std::mem::size_of::<OPENFILENAMEW>() as u32;
-    ofn.hwndOwner = owner.handle.hwnd().unwrap_or(std::ptr::null_mut());
-    ofn.lpstrFilter = filter.as_ptr();
-    ofn.lpstrFile = file.as_mut_ptr();
-    ofn.nMaxFile = file.len() as u32;
-    ofn.lpstrDefExt = ext.as_ptr(); // προσθέτει .json αν λείπει
-    ofn.lpstrTitle = title.as_ptr();
-    ofn.Flags = OFN_EXPLORER | OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
-    if unsafe { GetSaveFileNameW(&mut ofn) } == 0 {
-        return None;
-    }
-    let len = file.iter().position(|&c| c == 0).unwrap_or(file.len());
-    Some(std::ffi::OsString::from_wide(&file[..len]).into())
-}
-
 /// Θέση + μέγεθος σε λογικές μονάδες (το NWG κάνει την κλιμάκωση DPI).
 trait Place {
     fn place(&self, x: i32, y: i32, w: i32, h: i32);
@@ -463,7 +637,7 @@ macro_rules! place_impl {
         }
     )*};
 }
-place_impl!(nwg::Label, nwg::TextInput, nwg::TextBox, nwg::Button, nwg::CheckBox, nwg::TabsContainer);
+place_impl!(nwg::Label, nwg::TextInput, nwg::TextBox, nwg::Button, nwg::CheckBox, nwg::TabsContainer, nwg::ComboBox<String>, nwg::RichLabel);
 
 impl Place for Val {
     fn place(&self, x: i32, y: i32, w: i32, h: i32) {
@@ -484,6 +658,7 @@ fn main() {
     let weak = Rc::downgrade(&ui);
     let handler = nwg::full_bind_event_handler(&ui.window.handle, move |evt, data, handle| {
         let Some(ui) = weak.upgrade() else { return };
+        let bar = ui.bars.iter().position(|b| handle == b.search.handle || handle == b.afm.handle);
         match evt {
             Event::OnWindowClose if handle == ui.window.handle => nwg::stop_thread_dispatch(),
             Event::OnResize | Event::OnWindowMaximize if handle == ui.window.handle => ui.layout(),
@@ -492,18 +667,12 @@ fn main() {
                     info.set_min_size(MIN_W, MIN_H);
                 }
             }
-            Event::OnButtonClick if handle == ui.search.handle => ui.do_search(),
+            Event::OnButtonClick | Event::OnKeyEnter if bar.is_some() => ui.do_search(bar.unwrap()),
             Event::OnButtonClick if handle == ui.save.handle => ui.do_save(),
-            Event::OnButtonClick if handle == ui.export.handle => ui.do_export(),
-            Event::OnKeyEnter if handle == ui.afm.handle || handle == ui.pass.handle => ui.do_search(),
             // checkbox ΦΠΑ μόνο για ανάγνωση: επαναφορά της τιμής της ΑΑΔΕ
             Event::OnButtonClick => {
-                for f in &ui.fields {
-                    if let Val::Check(c) = &f.val {
-                        if handle == c.handle {
-                            ui.fill(ui.last.borrow().as_ref().unwrap_or(&Value::Null));
-                        }
-                    }
+                if ui.fields.iter().any(|f| matches!(&f.val, Val::Check(c) if handle == c.handle)) {
+                    ui.fill(ui.last.borrow().as_ref().unwrap_or(&Value::Null), &[P_BASIC]);
                 }
             }
             _ => {}
@@ -535,5 +704,12 @@ mod tests {
             {"firm_act_code": "2", "firm_act_descr": "ΒΒ", "firm_act_kind_descr": "ΔΕΥΤΕΡΕΥΟΥΣΑ"}]}});
         assert_eq!(acts_text(&acts), "ΚΑΔ 1  ·  ΚΥΡΙΑ\r\nΑΑ\r\n\r\nΚΑΔ 2  ·  ΔΕΥΤΕΡΕΥΟΥΣΑ\r\nΒΒ");
         assert_eq!(esc("a&<b>"), "a&amp;&lt;b&gt;");
+        assert_eq!(split_address("ΑΙΟΛΟΥ 86        10559 - ΑΘΗΝΑ"), ["ΑΙΟΛΟΥ", "86", "10559", "ΑΘΗΝΑ"].map(String::from));
+        assert_eq!(split_address("VIA RICHINI 6\n20122 MILANO MI"), ["VIA RICHINI", "6", "20122", "MILANO MI"].map(String::from));
+        assert_eq!(clean_vat("DE", "de 123.456.789"), "123456789");
+        assert_eq!(clean_vat("EL", "GR094019245"), "094019245");
+        assert_eq!(clean_vat("EL", "094019245"), "094019245");
+        assert_eq!(clean_vat("NL", "NL123456789B01"), "123456789B01");
+        assert_eq!(split_address("ΚΑΠΟΙΑ ΟΔΟΣ"), ["ΚΑΠΟΙΑ ΟΔΟΣ", "", "", ""].map(String::from));
     }
 }
