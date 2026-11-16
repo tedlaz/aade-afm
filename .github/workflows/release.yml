@@ -13,7 +13,7 @@ jobs:
   build:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Εγκατάσταση Rust nightly (χρειάζεται για build-std / Windows 7)
         run: |
@@ -30,7 +30,7 @@ jobs:
           Copy-Item target\x86_64-win7-windows-msvc\release\aade-afm.exe "aade-afm-$ver.exe"
 
       - name: Δημιουργία GitHub Release με το .exe
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: aade-afm-*.exe
           generate_release_notes: true
